@@ -1,9 +1,14 @@
 package com.example.demo;
 
-import javax.crypto.SecretKeyFactory;
-import javax.crypto.spec.PBEKeySpec;
+import org.hibernate.Session;
+import org.hibernate.SessionFactory;
+import org.hibernate.Transaction;
+import org.hibernate.boot.MetadataSources;
+import org.hibernate.boot.registry.StandardServiceRegistry;
+import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.exception.ConstraintViolationException;
+
 import java.io.IOException;
-import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -11,208 +16,329 @@ import java.nio.file.Paths;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.SQLIntegrityConstraintViolationException;
-import java.sql.Statement;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Properties;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
 
-/**
- * Пользователи хранятся в MySQL (таблица users), доступ через чистый JDBC.
- * Параметры подключения читаются из файла db.properties, который лежит на сервере
- * рядом с домашними папками, поэтому пароль от БД не попадает в репозиторий.
- */
 public final class UserStore {
 
-    private static final Logger LOG = Logger.getLogger(UserStore.class.getName());
+    private static final Logger LOG =
+            Logger.getLogger(UserStore.class.getName());
 
-    private static final Path BASE = Paths.get(System.getProperty("filemanager.dir",
-            "/var/lib/tomcat10/filemanager")).toAbsolutePath().normalize();
-    /** Родительская папка для домашних папок: .../filemanager/homes */
+    private static final Path BASE = Paths.get(
+            System.getProperty(
+                    "filemanager.dir",
+                    "/var/lib/tomcat10/filemanager"
+            )
+    ).toAbsolutePath().normalize();
+
     public static final Path HOMES_ROOT = BASE.resolve("homes");
-    /** Файл с параметрами подключения к БД (url, user, password). */
-    private static final Path DB_CONFIG = BASE.resolve("db.properties");
 
-    // Только эти символы: в логине не будет "..", "/" и "\"
-    private static final Pattern LOGIN = Pattern.compile("[a-z0-9_-]{3,32}");
+    private static final Path DB_CONFIG =
+            BASE.resolve("db.properties");
+
+    private static final Pattern LOGIN =
+            Pattern.compile("[a-z0-9_-]{3,32}");
+
     private static final SecureRandom RND = new SecureRandom();
-
-    private static final String CREATE_TABLE =
-            "CREATE TABLE IF NOT EXISTS users ("
-                    + " id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,"
-                    + " login VARCHAR(32) NOT NULL,"
-                    + " salt VARCHAR(64) NOT NULL,"
-                    + " password_hash VARCHAR(128) NOT NULL,"
-                    + " email VARCHAR(255) NOT NULL,"
-                    + " created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,"
-                    + " UNIQUE KEY uk_users_login (login)"
-                    + ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
-    private static final String INSERT_USER =
-            "INSERT INTO users (login, salt, password_hash, email) VALUES (?, ?, ?, ?)";
-    private static final String SELECT_USER =
-            "SELECT salt, password_hash FROM users WHERE login = ?";
 
     private static final UserStore INSTANCE = new UserStore();
 
-    private Properties dbConfig;   // читается из db.properties при первом обращении к БД
-    private boolean schemaReady;   // таблица users уже проверена/создана
+    private volatile SessionFactory sessionFactory;
 
     private UserStore() {
-        // Ничего не делаем здесь: если БД недоступна при старте приложения,
-        // это не должно ломать загрузку класса. Подключаемся лениво.
     }
 
     public static UserStore get() {
         return INSTANCE;
     }
 
-    /** Логин без учёта регистра: так Bob и bob не создадут две разные папки. */
     public static String normalize(String login) {
-        return login == null ? "" : login.trim().toLowerCase(Locale.ROOT);
+        return login == null
+                ? ""
+                : login.trim().toLowerCase(Locale.ROOT);
     }
 
-    /** Возвращает текст ошибки или null, если регистрация прошла. */
-    public String register(String rawLogin, String password, String email) {
+    public String register(
+            String rawLogin,
+            String password,
+            String email) {
+
         String login = normalize(rawLogin);
+
         if (!LOGIN.matcher(login).matches()) {
             return "Логин: 3-32 символа, латинские буквы, цифры, _ и -";
         }
+
         if (password == null || password.length() < 4) {
             return "Пароль должен быть не короче 4 символов";
         }
-        if (email == null || !email.trim().matches("[^@\\s]+@[^@\\s]+\\.[^@\\s]+")) {
+
+        if (email == null ||
+                !email.trim().matches("[^@\\s]+@[^@\\s]+\\.[^@\\s]+")) {
             return "Некорректный email";
         }
 
         try {
             byte[] salt = new byte[16];
             RND.nextBytes(salt);
+
             String saltB64 = b64(salt);
             String hashB64 = b64(hash(password, salt));
 
             Files.createDirectories(homeDir(login));
 
-            // Уникальность логина гарантирует UNIQUE-индекс в БД, а не проверка в коде:
-            // так два одновременных запроса не создадут дубликат.
-            try (Connection c = connect();
-                 PreparedStatement ps = c.prepareStatement(INSERT_USER)) {
-                ps.setString(1, login);
-                ps.setString(2, saltB64);
-                ps.setString(3, hashB64);
-                ps.setString(4, email.trim());
-                ps.executeUpdate();
+            UserEntity user = new UserEntity(
+                    login,
+                    saltB64,
+                    hashB64,
+                    email.trim()
+            );
+
+            try (Session session = getSessionFactory().openSession()) {
+                Transaction tx = session.beginTransaction();
+
+                try {
+                    session.persist(user);
+                    tx.commit();
+                    return null;
+                } catch (RuntimeException e) {
+                    if (tx.isActive()) {
+                        try {
+                            tx.rollback();
+                        } catch (RuntimeException rollbackError) {
+                            e.addSuppressed(rollbackError);
+                        }
+                    }
+
+                    if (isDuplicateLogin(e)) {
+                        return "Такой логин уже занят";
+                    }
+
+                    LOG.log(
+                            Level.SEVERE,
+                            "Ошибка Hibernate при регистрации " + login,
+                            e
+                    );
+
+                    return "Ошибка базы данных: " + rootMessage(e);
+                }
             }
-            return null;
-        } catch (SQLIntegrityConstraintViolationException e) {
-            return "Такой логин уже занят";
-        } catch (SQLException e) {
-            if (e.getErrorCode() == 1062) {          // ER_DUP_ENTRY
-                return "Такой логин уже занят";
-            }
-            LOG.log(Level.SEVERE, "Ошибка БД при регистрации пользователя " + login, e);
-            return "Ошибка базы данных: " + e.getMessage();
-        } catch (IOException | GeneralSecurityException e) {
-            LOG.log(Level.SEVERE, "Ошибка при регистрации пользователя " + login, e);
+        } catch (IOException e) {
+            LOG.log(
+                    Level.SEVERE,
+                    "Ошибка файловой системы для пользователя " + login,
+                    e
+            );
             return "Ошибка сервера: " + e.getMessage();
+        } catch (GeneralSecurityException e) {
+            LOG.log(Level.SEVERE, "Ошибка хеширования пароля", e);
+            return "Ошибка сервера при обработке пароля";
+        } catch (RuntimeException e) {
+            LOG.log(Level.SEVERE, "Не удалось зарегистрировать " + login, e);
+            return "Ошибка базы данных: " + rootMessage(e);
         }
     }
 
-    public boolean authenticate(String rawLogin, String password) {
-        if (password == null) return false;
+    public boolean authenticate(
+            String rawLogin,
+            String password) {
+
         String login = normalize(rawLogin);
-        if (!LOGIN.matcher(login).matches()) return false;
 
-        try (Connection c = connect();
-             PreparedStatement ps = c.prepareStatement(SELECT_USER)) {
-            ps.setString(1, login);
-            try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) return false;
-                byte[] salt = Base64.getDecoder().decode(rs.getString("salt"));
-                byte[] expected = Base64.getDecoder().decode(rs.getString("password_hash"));
-                return MessageDigest.isEqual(expected, hash(password, salt));
+        if (password == null || !LOGIN.matcher(login).matches()) {
+            return false;
+        }
+
+        try (Session session = getSessionFactory().openSession()) {
+            UserEntity user = session.createQuery(
+                            "FROM UserEntity WHERE login = :login",
+                            UserEntity.class
+                    )
+                    .setParameter("login", login)
+                    .uniqueResult();
+
+            if (user == null) {
+                return false;
             }
-        } catch (SQLException | GeneralSecurityException e) {
-            LOG.log(Level.SEVERE, "Ошибка при проверке пароля пользователя " + login, e);
-            throw new IllegalStateException("Ошибка базы данных: " + e.getMessage(), e);
+
+            byte[] salt = Base64.getDecoder().decode(user.getSalt());
+            byte[] expected =
+                    Base64.getDecoder().decode(user.getPasswordHash());
+
+            return MessageDigest.isEqual(expected, hash(password, salt));
+
+        } catch (GeneralSecurityException e) {
+            LOG.log(Level.SEVERE, "Ошибка проверки пароля", e);
+            throw new IllegalStateException(
+                    "Ошибка при проверке пароля", e
+            );
+        } catch (RuntimeException e) {
+            LOG.log(
+                    Level.SEVERE,
+                    "Ошибка Hibernate при входе пользователя " + login,
+                    e
+            );
+            throw new IllegalStateException(
+                    "Ошибка базы данных: " + rootMessage(e), e
+            );
         }
     }
 
-    /** Домашняя папка пользователя. Передавать сюда нужно уже проверенный логин. */
     public Path homeDir(String login) {
         return HOMES_ROOT.resolve(login);
     }
 
-    // ---------------------------------------------------------------- JDBC
+    private SessionFactory getSessionFactory() {
+        SessionFactory result = sessionFactory;
 
-    private Connection connect() throws SQLException {
-        Properties cfg = config();
-        Connection c = DriverManager.getConnection(
-                cfg.getProperty("url"), cfg.getProperty("user"), cfg.getProperty("password"));
-        try {
-            ensureSchema(c);
-            return c;
-        } catch (SQLException | RuntimeException e) {
-            try {
-                c.close();
-            } catch (SQLException ignored) {
-                // основная ошибка важнее
+        if (result == null) {
+            synchronized (this) {
+                result = sessionFactory;
+
+                if (result == null) {
+                    result = buildSessionFactory();
+                    sessionFactory = result;
+                }
             }
-            throw e;
         }
+
+        return result;
     }
 
-    /** Читает db.properties один раз. Если файла нет, при следующем запросе попробует снова. */
-    private synchronized Properties config() throws SQLException {
-        if (dbConfig != null) return dbConfig;
+    private SessionFactory buildSessionFactory() {
+        Properties db = new Properties();
 
-        try {
-            Class.forName("com.mysql.cj.jdbc.Driver");
-        } catch (ClassNotFoundException e) {
-            throw new SQLException("В приложении нет драйвера MySQL (mysql-connector-j)", e);
-        }
-
-        Properties p = new Properties();
-        try (Reader r = Files.newBufferedReader(DB_CONFIG, StandardCharsets.UTF_8)) {
-            p.load(r);
+        try (var reader = Files.newBufferedReader(
+                DB_CONFIG, StandardCharsets.UTF_8)) {
+            db.load(reader);
         } catch (IOException e) {
-            throw new SQLException("Не удалось прочитать файл настроек БД " + DB_CONFIG + " (" + e + ")", e);
+            throw new IllegalStateException(
+                    "Не удалось прочитать настройки БД: " + DB_CONFIG, e
+            );
         }
-        for (String key : new String[] {"url", "user", "password"}) {
-            String v = p.getProperty(key);
-            if (v == null) {
-                throw new SQLException("В файле " + DB_CONFIG + " нет параметра " + key);
+
+        String url = required(db, "url");
+        String user = required(db, "user");
+        String password = required(db, "password");
+
+        Map<String, Object> settings = new HashMap<>();
+        settings.put(
+                "hibernate.connection.driver_class",
+                "com.mysql.cj.jdbc.Driver"
+        );
+        settings.put("hibernate.connection.url", url);
+        settings.put("hibernate.connection.username", user);
+        settings.put("hibernate.connection.password", password);
+        settings.put("hibernate.dialect", "org.hibernate.dialect.MySQLDialect");
+        settings.put("hibernate.hbm2ddl.auto", "update");
+        settings.put("hibernate.show_sql", "false");
+        settings.put("hibernate.format_sql", "false");
+
+        StandardServiceRegistry registry =
+                new StandardServiceRegistryBuilder()
+                        .applySettings(settings)
+                        .build();
+
+        try {
+            return new MetadataSources(registry)
+                    .addAnnotatedClass(UserEntity.class)
+                    .buildMetadata()
+                    .buildSessionFactory();
+        } catch (RuntimeException e) {
+            StandardServiceRegistryBuilder.destroy(registry);
+            throw new IllegalStateException(
+                    "Не удалось запустить Hibernate. Проверьте MySQL "
+                            + "и db.properties.",
+                    e
+            );
+        }
+    }
+
+    private static String required(Properties properties, String key) {
+        String value = properties.getProperty(key);
+
+        if (value == null || value.trim().isEmpty()) {
+            throw new IllegalStateException(
+                    "В файле " + DB_CONFIG + " отсутствует параметр " + key
+            );
+        }
+
+        return value.trim();
+    }
+
+    private static boolean isDuplicateLogin(Throwable error) {
+        Throwable current = error;
+
+        while (current != null) {
+            if (current instanceof ConstraintViolationException) {
+                ConstraintViolationException cve =
+                        (ConstraintViolationException) current;
+
+                if (cve.getConstraintName() == null ||
+                        cve.getConstraintName().contains("users_login") ||
+                        cve.getConstraintName().contains("uk_users_login")) {
+                    return true;
+                }
             }
-            p.setProperty(key, v.trim());
+
+            if (current instanceof SQLException) {
+                SQLException sql = (SQLException) current;
+
+                if (sql.getErrorCode() == 1062 ||
+                        (sql.getSQLState() != null &&
+                                sql.getSQLState().startsWith("23"))) {
+                    return true;
+                }
+            }
+
+            current = current.getCause();
         }
-        dbConfig = p;
-        return dbConfig;
+
+        return false;
     }
 
-    /** Создаёт таблицу users, если её ещё нет (выполняется один раз за запуск приложения). */
-    private synchronized void ensureSchema(Connection c) throws SQLException {
-        if (schemaReady) return;
-        try (Statement st = c.createStatement()) {
-            st.executeUpdate(CREATE_TABLE);
+    private static String rootMessage(Throwable error) {
+        Throwable current = error;
+
+        while (current.getCause() != null &&
+                current.getCause() != current) {
+            current = current.getCause();
         }
-        schemaReady = true;
+
+        return current.getMessage() == null
+                ? current.getClass().getSimpleName()
+                : current.getMessage();
     }
 
-    // ------------------------------------------------------------- пароли
+    private static byte[] hash(
+            String password,
+            byte[] salt) throws GeneralSecurityException {
 
-    private static byte[] hash(String password, byte[] salt) throws GeneralSecurityException {
-        PBEKeySpec spec = new PBEKeySpec(password.toCharArray(), salt, 120_000, 256);
-        return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        var spec = new javax.crypto.spec.PBEKeySpec(
+                password.toCharArray(),
+                salt,
+                120_000,
+                256
+        );
+
+        try {
+            return javax.crypto.SecretKeyFactory
+                    .getInstance("PBKDF2WithHmacSHA256")
+                    .generateSecret(spec)
+                    .getEncoded();
+        } finally {
+            spec.clearPassword();
+        }
     }
 
-    private static String b64(byte[] b) {
-        return Base64.getEncoder().encodeToString(b);
+    private static String b64(byte[] bytes) {
+        return Base64.getEncoder().encodeToString(bytes);
     }
 }
