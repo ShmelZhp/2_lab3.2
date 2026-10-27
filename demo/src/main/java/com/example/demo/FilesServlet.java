@@ -4,6 +4,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServlet;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
 
 import java.io.File;
 import java.io.IOException;
@@ -24,20 +25,33 @@ public class FilesServlet extends HttpServlet {
 
         request.setCharacterEncoding("UTF-8");
 
-        String pathParameter = request.getParameter("path");
-        if (pathParameter == null || pathParameter.isEmpty()) {
-            String home = System.getProperty("user.home");
-            pathParameter = (home != null && new File(home).isDirectory()) ? home : "/";
+        HttpSession session = request.getSession(false);
+        String user = session == null ? null : (String) session.getAttribute("user");
+        if (user == null) {
+            response.sendRedirect(request.getContextPath() + "/login");
+            return;
         }
 
-        File target = new File(pathParameter).getCanonicalFile();
+        // Корень пользователя: <homes>/<логин>. Канонический путь раскрывает ".." и симлинки.
+        Files.createDirectories(UserStore.get().homeDir(user));
+        File home = UserStore.get().homeDir(user).toFile().getCanonicalFile();
 
+        String pathParameter = request.getParameter("path");
+        File target = (pathParameter == null || pathParameter.isEmpty())
+                ? home
+                : new File(pathParameter).getCanonicalFile();
+
+        // Главная защита: цель обязана лежать внутри домашней папки.
+        if (!target.toPath().startsWith(home.toPath())) {
+            response.sendError(HttpServletResponse.SC_FORBIDDEN, "Доступ только к своей папке");
+            return;
+        }
         if (!target.exists()) {
             response.sendError(HttpServletResponse.SC_NOT_FOUND, "Путь не существует");
             return;
         }
 
-        // Ссылка на файл в JSP ведет на /files?path=..., поэтому файл отдаем на скачивание.
+        // Ссылка на файл в JSP ведёт на /files?path=..., поэтому файл отдаём на скачивание.
         if (target.isFile()) {
             sendFile(target, response);
             return;
@@ -58,7 +72,8 @@ public class FilesServlet extends HttpServlet {
             entries.add(new FileEntry(f));
         }
 
-        File parent = target.getParentFile();
+        // В корне домашней папки ссылки «Вверх» нет.
+        File parent = target.equals(home) ? null : target.getParentFile();
 
         request.setAttribute("currentPath", target.getPath());
         request.setAttribute("parentPath", parent != null ? parent.getPath() : null);

@@ -14,6 +14,8 @@
         h1 { font-size: 22px; word-break: break-all; margin: 8px 0 12px;
              padding-bottom: 12px; border-bottom: 1px solid #ddd; }
         .up { display: inline-block; margin: 4px 0 14px; }
+        .top { display: flex; justify-content: space-between; align-items: center; }
+        .logout button { padding: 6px 14px; cursor: pointer; }
         table { width: 100%; border-collapse: collapse; }
         th { text-align: left; padding: 8px; border-bottom: 2px solid #ccc;
              font-size: 14px; color: #555; }
@@ -27,8 +29,14 @@
     </style>
 </head>
 <body>
-<div class="time">
-    <fmt:formatDate value="${now}" pattern="dd.MM.yyyy HH:mm:ss"/>
+<div class="top">
+    <div class="time">
+        <fmt:formatDate value="${now}" pattern="dd.MM.yyyy HH:mm:ss"/>
+    </div>
+    <form class="logout" method="post" action="${pageContext.request.contextPath}/logout">
+        <c:out value="${sessionScope.user}"/>
+        <button type="submit">Выйти</button>
+    </form>
 </div>
 <h1><c:out value="${currentPath}"/></h1>
 
